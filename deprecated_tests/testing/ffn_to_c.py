@@ -1,20 +1,6 @@
-"""
-Full pipeline: PyTorch ToyFFN -> Torch-MLIR (linalg-on-tensors) -> matmul
-shapes -> tiled, per-vault instruction schedule with resolved NMP-vault
-addresses.
-
-Requires (stages 1-2 only): torch, torch-mlir installed in your environment.
-Stages 3-8 are pure Python / MLIR-python-bindings and have no other deps.
-
-Hardware assumption baked in throughout: 8 vaults, each a 32x32 systolic
-array + 1GB NMP memory. Mapping strategy: split the batch/row dimension (M)
-across the 8 vaults (data-parallel); weights/biases are replicated
-identically into every vault. See conversation history for why this beats
-splitting the hidden dim for a model this size.
-"""
-
-import math
 import json
+import math
+import os
 
 # ============================================================
 # Stage 1: Define the model and export to Torch-MLIR (linalg-on-tensors)
@@ -98,9 +84,7 @@ def extract_matmul_shapes(mlir_path="ffn_clean.mlir"):
 
         walk(module.operation)
 
-    return shapes  # NOTE: order-based ([0]=up_proj, [1]=down_proj) -- fine for
-                   # a 2-matmul toy FFN; tag ops with a "role" attribute instead
-                   # once you point this at models with more matmuls (see convo).
+    return shapes
 
 
 # Fixed role mapping for THIS toy FFN (up_proj then down_proj, in file order)
@@ -115,14 +99,8 @@ ROLES = [
 # ============================================================
 
 def build_layout(matmul_shapes, roles, num_vaults=8, elem_bytes=4):
-    """
-    Lays out weights/biases (replicated, same address in every vault) and
-    activation tensors (each vault only holds its own row-slice) back to
-    back in a single flat per-vault address space starting at 0.
-    Returns (layout dict, rows_per_vault, total bytes used per vault).
-    """
     M_total = matmul_shapes[0][0]
-    assert M_total % num_vaults == 0, "M must divide evenly across vaults for this simple mapping"
+    assert M_total % num_vaults == 0, "M must divide evenly across vaults"
     rows_per_vault = M_total // num_vaults
 
     layout = {}
@@ -135,7 +113,6 @@ def build_layout(matmul_shapes, roles, num_vaults=8, elem_bytes=4):
         layout[role["bias"]] = {"base": offset, "size": b_size, "width": N}
         offset += b_size
 
-    # activation tensors: only the input to stage 0, and each stage's output
     K0 = matmul_shapes[0][1]
     N0 = matmul_shapes[0][2]
     N1 = matmul_shapes[1][2]
@@ -150,8 +127,7 @@ def build_layout(matmul_shapes, roles, num_vaults=8, elem_bytes=4):
 
 
 # ============================================================
-# Stage 5-6: Tile each matmul's iteration space into 32x32 blocks and
-# resolve each block's operands to concrete byte addresses
+# Stage 5-6: Tile each matmul's iteration space into 32x32 blocks
 # ============================================================
 
 def gen_stage_instrs(K, N, role, layout, rows_per_vault, tile=32, elem_bytes=4):
@@ -165,7 +141,7 @@ def gen_stage_instrs(K, N, role, layout, rows_per_vault, tile=32, elem_bytes=4):
     for j in range(n_n):
         for k in range(n_k):
             w_addr = w_base + (k * tile * w_width + j * tile) * elem_bytes
-            a_addr = a_base + (k * tile) * elem_bytes  # column offset; row0 implicit (whole slice streams)
+            a_addr = a_base + (k * tile) * elem_bytes
             instrs.append({"stage": role["stage"], "op": "LOAD_WEIGHTS", "n": j, "k": k,
                             "addr": w_addr, "size": tile * tile * elem_bytes,
                             "clear_acc": (k == 0)})
@@ -181,15 +157,12 @@ def gen_stage_instrs(K, N, role, layout, rows_per_vault, tile=32, elem_bytes=4):
 
 
 # ============================================================
-# Stage 7-8: Assemble the full per-vault schedule and write it out
+# Stage 7-8: Assemble all vault schedules
 # ============================================================
 
 def build_all_vault_schedules(matmul_shapes, roles, num_vaults=8, tile=32, elem_bytes=4):
     layout, rows_per_vault, per_vault_bytes = build_layout(matmul_shapes, roles, num_vaults, elem_bytes)
 
-    # Addresses are identical across vaults (each vault's local space starts
-    # at 0), so compute the schedule once and reuse it per vault; only the
-    # vault id differs, since that's what selects the physical Link/port.
     single_vault_schedule = []
     for (M, K, N), role in zip(matmul_shapes, roles):
         single_vault_schedule += gen_stage_instrs(K, N, role, layout, rows_per_vault, tile, elem_bytes)
@@ -198,25 +171,126 @@ def build_all_vault_schedules(matmul_shapes, roles, num_vaults=8, tile=32, elem_
     return all_vaults, layout, rows_per_vault, per_vault_bytes
 
 
+# ============================================================
+# Stage 9: Generate C code for a given vault using `cgen`
+# ============================================================
+
+def generate_vault_c_code(vault_id, vault_instructions, output_filename=None):
+    """
+    Takes an instruction list for a target vault ID and uses `cgen` to generate
+    a C file containing the program schedule.
+    """
+    import cgen
+
+    if output_filename is None:
+        output_filename = f"vault_{vault_id}_schedule.c"
+
+    # Define instruction structure type
+    struct_instr = cgen.Struct(
+        "NMPInstruction",
+        [
+            cgen.Value("const char *", "stage"),
+            cgen.Value("const char *", "op"),
+            cgen.Value("uint32_t", "addr"),
+            cgen.Value("uint32_t", "size"),
+            cgen.Value("bool", "clear_acc"),
+            cgen.Value("bool", "final_drain"),
+        ],
+    )
+
+    # Convert Python instruction dictionary array into C struct initializers
+    c_instr_items = []
+    for instr in vault_instructions:
+        clear_acc = "true" if instr.get("clear_acc", False) else "false"
+        final_drain = "true" if instr.get("final", False) else "false"
+        c_instr_items.append(
+            f'  {{ "{instr["stage"]}", "{instr["op"]}", 0x{instr["addr"]:08X}U, '
+            f'{instr["size"]}U, {clear_acc}, {final_drain} }}'
+        )
+
+    array_init_text = "{\n" + ",\n".join(c_instr_items) + "\n}"
+
+    # Construct the full standard AST / hierarchy using cgen
+    c_file_ast = cgen.Module(
+        [
+            cgen.Comment(f"Auto-generated NMP Schedule for Vault {vault_id}"),
+            cgen.Include("stdint.h"),
+            cgen.Include("stdbool.h"),
+            cgen.Include("stdio.h"),
+            cgen.Line(),
+            cgen.Define("TARGET_VAULT_ID", str(vault_id)),
+            cgen.Define("TOTAL_INSTRUCTIONS", str(len(vault_instructions))),
+            cgen.Line(),
+            struct_instr,
+            cgen.Line(),
+            cgen.Value(
+                "const NMPInstruction",
+                f"VAULT_{vault_id}_SCHEDULE[TOTAL_INSTRUCTIONS] = {array_init_text}",
+            ),
+            cgen.Line(),
+            cgen.FunctionBody(
+                cgen.FunctionDeclaration(
+                    cgen.Value("void", f"execute_vault_{vault_id}_schedule"), []
+                ),
+                cgen.Block(
+                    [
+                        cgen.Statement(
+                            f'printf("=== Executing NMP Schedule for Vault %d (%d instructions) ===\\n", TARGET_VAULT_ID, TOTAL_INSTRUCTIONS)'
+                        ),
+                        cgen.For(
+                            "int i = 0",
+                            "i < TOTAL_INSTRUCTIONS",
+                            "i++",
+                            cgen.Block(
+                                [
+                                    cgen.Statement(
+                                        f"const NMPInstruction *inst = &VAULT_{vault_id}_SCHEDULE[i]"
+                                    ),
+                                    cgen.Statement(
+                                        'printf("[%03d] [%s] %-12s | Addr: 0x%08X | Size: %6u bytes | ClearAcc: %d\\n", '
+                                        'i, inst->stage, inst->op, inst->addr, inst->size, inst->clear_acc)'
+                                    ),
+                                ]
+                            ),
+                        ),
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    c_code_str = str(c_file_ast)
+
+    with open(output_filename, "w") as f:
+        f.write(c_code_str)
+
+    print(f"Generated C schedule for Vault {vault_id}: {output_filename}")
+    return output_filename
+
+
 if __name__ == "__main__":
+    # --- Configuration Parameters ---
     NUM_VAULTS = 8
     TILE = 32
     ELEM_BYTES = 4
+    TARGET_VAULT_ID = 0  # Change this parameter to target any vault (0 to NUM_VAULTS - 1)
 
-    # Stages 1-2 require torch + torch-mlir; comment out if running elsewhere
+    # Execute MLIR pipeline
     export_ffn_to_linalg("ffn_linalg.mlir")
     clean_ir("ffn_linalg.mlir", "ffn_clean.mlir")
     matmul_shapes = extract_matmul_shapes("ffn_clean.mlir")
 
+    # Build schedules for all vaults
     all_vaults, layout, rows_per_vault, per_vault_bytes = build_all_vault_schedules(
         matmul_shapes, ROLES, NUM_VAULTS, TILE, ELEM_BYTES
     )
 
-    print("matmul shapes (M,K,N):", matmul_shapes)
-    print("layout:", json.dumps(layout, indent=2))
-    print(f"per-vault usage: {per_vault_bytes/1e6:.2f} MB of 1024 MB")
-    print(f"instructions per vault: {len(all_vaults[0])}  (x{NUM_VAULTS} vaults)")
+    # Slice out single vault instruction list
+    vault_schedule = all_vaults[TARGET_VAULT_ID]
 
-    with open("instructions_with_addr.json", "w") as f:
-        json.dump(all_vaults, f, indent=2)
-    print("wrote instructions_with_addr.json")
+    # Generate single C file for specified target vault
+    generate_vault_c_code(
+        vault_id=TARGET_VAULT_ID,
+        vault_instructions=vault_schedule,
+        output_filename=f"vault_{TARGET_VAULT_ID}_driver.c",
+    )
