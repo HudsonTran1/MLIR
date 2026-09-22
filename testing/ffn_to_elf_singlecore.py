@@ -166,7 +166,7 @@ def build_single_vault_schedule(matmul_shapes, roles, num_vaults=1, tile=32, ele
 
 
 # ============================================================
-# Stage 8-9: Package Core Instructions & Data into an ELF
+# Stage 8-9: Package Core Instructions & Data into a RISC-V Bare-Metal ELF
 # ============================================================
 
 def create_core_elf(vault_id, instructions, layout, rows_per_vault):
@@ -183,17 +183,17 @@ def create_core_elf(vault_id, instructions, layout, rows_per_vault):
     ELFDATA2LSB = 1
     EV_CURRENT = 1
     ET_EXEC = 2
-    EM_NONE = 0
+    EM_RISCV = 243         # RISC-V Machine ID matching riscv64-unknown-elf toolchain
     
     e_ident = b'\x7fELF' + bytes([ELFCLASS64, ELFDATA2LSB, EV_CURRENT, 0]) + b'\x00' * 8
     
     e_type = ET_EXEC
-    e_machine = EM_NONE
+    e_machine = EM_RISCV
     e_version = EV_CURRENT
-    e_entry = 0x400000
+    e_entry = 0x00010000   # FLASH_BASE from build script
     e_phoff = 64
     e_shoff = 64 + 2 * 56
-    e_flags = 0
+    e_flags = 0            # RV64IM ABIs standard flags
     e_ehsize = 64
     e_phentsize = 56
     e_phnum = 2
@@ -225,6 +225,7 @@ def create_core_elf(vault_id, instructions, layout, rows_per_vault):
     PF_X = 1
     PF_W = 2
 
+    # Phdr 1: .instructions loaded at FLASH_BASE (0x00010000)
     phdr_instr = struct.pack(
         '<IIQQQQQQ',
         PT_LOAD, PF_R | PF_X,
@@ -232,7 +233,8 @@ def create_core_elf(vault_id, instructions, layout, rows_per_vault):
         instr_size, instr_size, 16
     )
 
-    data_vaddr = e_entry + 0x100000
+    # Phdr 2: .data loaded at RAM_BASE (0x01000000) matching build script memory map
+    data_vaddr = 0x01000000 
     phdr_data = struct.pack(
         '<IIQQQQQQ',
         PT_LOAD, PF_R | PF_W,
@@ -298,9 +300,9 @@ if __name__ == "__main__":
     print(f"Memory usage for 1 core: {per_vault_bytes / 1e6:.2f} MB")
     print(f"Total instructions generated: {len(schedule)}")
 
-    # Stages 8-9: Package to ELF
+    # Stages 8-9: Package to RISC-V Bare-Metal ELF format
     elf_data = create_core_elf(vault_id=0, instructions=schedule, layout=layout, rows_per_vault=rows_per_vault)
     with open("vault_0.elf", "wb") as f:
         f.write(elf_data)
     
-    print("Successfully generated vault_0.elf")
+    print("Successfully generated RISC-V bare-metal-compliant vault_0.elf")
