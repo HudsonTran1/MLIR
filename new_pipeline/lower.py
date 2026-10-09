@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-lower_to_c.py -- linalg-on-tensors -> bufferized loops -> EmitC -> vault0.c -> vault0.elf
-
-Target Hardware Profile: Freestanding Bare-Metal RV64GC Core (SST Vanadis)
+lower_to_c.py -- linalg-on-tensors -> Bufferized Loops -> EmitC -> Bare-Metal Harness
 """
 import argparse
 import random
@@ -189,7 +187,6 @@ def carr(name, shape, vals, const=True):
 
 
 def make_cast(shape):
-    """Generates C array pointer cast matching MLIR EmitC parameter signatures."""
     if len(shape) <= 1:
         return "(float *)"
     sub_dims = "".join(f"[{d}]" for d in shape[1:])
@@ -226,7 +223,6 @@ def harness(kernel_c, fname, ins, out, data, expected):
     out_bytes = n_out * 4
     lines.append(f"    hal_buffer_t buf_out0 = hal_buffer_create((void*)raw_out0, {out_bytes}, 0);")
     
-    # Cast host_ptr to array pointer types matching generated EmitC parameters
     args = []
     for i, s in enumerate(ins):
         args.append(f"{make_cast(s)}buf_in{i}.host_ptr")
@@ -281,9 +277,15 @@ def main():
     ap.add_argument("--outdir", default="build")
     ap.add_argument("--mlir-opt")
     ap.add_argument("--mlir-translate")
-    ap.add_argument("--cc", default="riscv64-unknown-elf-gcc")
-    ap.add_argument("--march", default="rv64im")
-    ap.add_argument("--no-compile", action="store_true")
+    
+    # Pluggable HAL Cross-Compilation Options
+    ap.add_argument("--hal-src", default="hal_vanadis.c", help="Path to the HAL implementation .c file")
+    ap.add_argument("--num-cores", type=int, default=1, help="Number of cores/vaults for the target HAL")
+    ap.add_argument("--cc", default="riscv64-unknown-elf-gcc", help="Cross compiler executable")
+    ap.add_argument("--march", default="rv64gc", help="Target architecture flag")
+    ap.add_argument("--mabi", default="lp64d", help="Target ABI flag")
+    ap.add_argument("--no-compile", action="store_true", help="Skip GCC cross-compilation")
+    
     a = ap.parse_args()
 
     outdir = Path(a.outdir)
@@ -305,20 +307,36 @@ def main():
 
     data = make_data(ins, a.seed)
     expected = reference(kind, ins, data)
+    
+    # 1. Output the main C harness
     c_path = outdir / f"{a.name}.c"
     c_path.write_text(harness(kernel_c, fname, ins, out, data, expected))
+    
+    # 2. Copy hal.h into the build directory
     shutil.copy(Path(__file__).with_name("hal.h"), outdir / "hal.h")
     print(f"wrote {c_path}  (kernel @{fname}, inputs {ins}, output {out})")
 
+    # 3. Handle optional Cross-Compilation step
     if a.no_compile or not shutil.which(a.cc):
         return
+
+    hal_src_path = Path(a.hal_src)
+    if not hal_src_path.exists():
+        sys.exit(f"Error: HAL source file '{hal_src_path}' not found.")
+
     elf = outdir / f"{a.name}.elf"
     flags = [
-        "-O2", f"-march={a.march}", "-mabi=lp64",
-        "-nostdlib", "-ffreestanding",
+        "-O2",
+        f"-march={a.march}",
+        f"-mabi={a.mabi}",
+        f"-DHAL_NUM_CORES={a.num_cores}",
+        "-nostdlib",
+        "-ffreestanding",
         "-fno-tree-loop-distribute-patterns"
     ]
-    run([a.cc, *flags, "-I", str(outdir), "-o", str(elf), str(c_path), "-lgcc"])
+    
+    # Link harness C file together with selected hal.c implementation
+    run([a.cc, *flags, "-I", str(outdir), "-o", str(elf), str(c_path), str(hal_src_path), "-lgcc"])
     print(f"wrote {elf}")
 
 
